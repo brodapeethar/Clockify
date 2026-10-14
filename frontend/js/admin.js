@@ -1,18 +1,29 @@
 /**
  * Clockify — Admin Dashboard Controller (admin.js)
- * KPI counters, geofence management, live attendance table & CSV export.
+ * Stat tiles, geofence management, month-navigable attendance log & CSV export.
  * Requires api.js (ApiClient) loaded first.
  */
 
 const AdminApp = (() => {
   const REFRESH_INTERVAL_MS = 30000;
+  const MONTH_NAMES = ["January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December"];
 
   const els = {
+    topbarDate: document.getElementById("topbarDate"),
+    liveClock: document.getElementById("liveClock"),
+
     kpiTotalEmployees: document.getElementById("kpiTotalEmployees"),
     kpiClockedInToday: document.getElementById("kpiClockedInToday"),
     kpiLateArrivals: document.getElementById("kpiLateArrivals"),
     kpiOutsideAttempts: document.getElementById("kpiOutsideAttempts"),
 
+    geoName: document.getElementById("geoName"),
+    geoCoords: document.getElementById("geoCoords"),
+    geoRadius: document.getElementById("geoRadius"),
+    geoUpdated: document.getElementById("geoUpdated"),
+    btnToggleEdit: document.getElementById("btnToggleEdit"),
+    geofenceForm: document.getElementById("geofenceForm"),
     workplaceName: document.getElementById("workplaceName"),
     workplaceLat: document.getElementById("workplaceLat"),
     workplaceLon: document.getElementById("workplaceLon"),
@@ -20,19 +31,26 @@ const AdminApp = (() => {
     btnUseCurrentLocation: document.getElementById("btnUseCurrentLocation"),
     btnSaveGeofence: document.getElementById("btnSaveGeofence"),
 
-    filterDate: document.getElementById("filterDate"),
+    recordCount: document.getElementById("recordCount"),
+    monthLabel: document.getElementById("monthLabel"),
+    btnPrevMonth: document.getElementById("btnPrevMonth"),
+    btnNextMonth: document.getElementById("btnNextMonth"),
+    btnToday: document.getElementById("btnToday"),
     searchEmployee: document.getElementById("searchEmployee"),
     btnExportCsv: document.getElementById("btnExportCsv"),
+    navExport: document.getElementById("navExport"),
     btnSeedDemo: document.getElementById("btnSeedDemo"),
     attendanceTableBody: document.getElementById("attendanceTableBody"),
 
     toastContainer: document.getElementById("toastContainer")
   };
 
-  let allRecords = [];
-  let currentGeofence = null;
-
-  const todayStr = () => new Date().toISOString().split("T")[0];
+  const state = {
+    allRecords: [],
+    currentGeofence: null,
+    viewMonth: new Date(),
+    expandedId: null
+  };
 
   function escapeHtml(value) {
     return String(value)
@@ -42,10 +60,35 @@ const AdminApp = (() => {
       .replace(/"/g, "&quot;");
   }
 
+  const pad = (n) => String(n).padStart(2, "0");
+  const todayStr = () => {
+    const d = new Date();
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  };
+
+  function countUp(el, target, suffix = "") {
+    const start = parseInt(el.textContent, 10) || 0;
+    if (start === target) {
+      el.textContent = target + suffix;
+      return;
+    }
+    const duration = 500;
+    const t0 = performance.now();
+    function frame(t) {
+      const p = Math.min((t - t0) / duration, 1);
+      const eased = 1 - Math.pow(1 - p, 3);
+      el.textContent = Math.round(start + (target - start) * eased) + suffix;
+      if (p < 1) requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+  }
+
   // ================= Initialization =================
   async function init() {
+    document.documentElement.style.scrollBehavior = "smooth";
+    startClock();
     bindEvents();
-    els.filterDate.value = todayStr();
+    renderMonthLabel();
     await Promise.all([loadKpis(), loadGeofence(), loadRecords()]);
     setInterval(refreshLiveData, REFRESH_INTERVAL_MS);
   }
@@ -54,27 +97,50 @@ const AdminApp = (() => {
     await Promise.all([loadKpis({ silent: true }), loadRecords({ silent: true })]);
   }
 
-  // ================= KPI Cards =================
+  function startClock() {
+    function tick() {
+      const now = new Date();
+      els.liveClock.textContent = now.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+      els.topbarDate.textContent = now.toLocaleDateString([], {
+        weekday: "long", year: "numeric", month: "long", day: "numeric"
+      });
+    }
+    tick();
+    setInterval(tick, 1000);
+  }
+
+  // ================= KPI Stat Tiles =================
   async function loadKpis({ silent } = {}) {
     try {
       const [employees, metrics] = await Promise.all([
         ApiClient.getEmployees(),
         ApiClient.getAdminMetrics()
       ]);
-      els.kpiTotalEmployees.textContent = employees.length;
-      els.kpiClockedInToday.textContent = metrics.total_present ?? 0;
-      els.kpiLateArrivals.textContent = metrics.late_arrivals ?? 0;
-      els.kpiOutsideAttempts.textContent = metrics.outside_boundary_attempts ?? 0;
+      countUp(els.kpiTotalEmployees, employees.length);
+      countUp(els.kpiClockedInToday, metrics.total_present ?? 0);
+      countUp(els.kpiLateArrivals, metrics.late_arrivals ?? 0);
+      countUp(els.kpiOutsideAttempts, metrics.outside_boundary_attempts ?? 0);
     } catch (err) {
       if (!silent) showToast("Failed to load dashboard metrics.", "error");
     }
   }
 
-  // ================= Geofence Settings =================
+  // ================= Workplace / Geofence Card =================
+  function renderGeofenceSummary(geo) {
+    els.geoName.textContent = geo.name || "—";
+    els.geoCoords.textContent = `${geo.latitude ?? "—"}, ${geo.longitude ?? "—"}`;
+    els.geoRadius.textContent = `${geo.radius_meters ?? "—"} m radius`;
+    const updated = geo.updated_at ? new Date(geo.updated_at) : null;
+    els.geoUpdated.textContent = updated && !isNaN(updated)
+      ? `Updated ${updated.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}`
+      : "Updated —";
+  }
+
   async function loadGeofence({ silent } = {}) {
     try {
       const geo = await ApiClient.getGeofence();
-      currentGeofence = geo;
+      state.currentGeofence = geo;
+      renderGeofenceSummary(geo);
       els.workplaceName.value = geo.name ?? "";
       els.workplaceLat.value = geo.latitude ?? "";
       els.workplaceLon.value = geo.longitude ?? "";
@@ -112,9 +178,12 @@ const AdminApp = (() => {
     try {
       const response = await ApiClient.updateGeofence({
         ...payload,
-        work_start_time: currentGeofence?.work_start_time || "09:00"
+        work_start_time: state.currentGeofence?.work_start_time || "09:00"
       });
-      currentGeofence = response.geofence || { ...currentGeofence, ...payload };
+      state.currentGeofence = response.geofence || { ...state.currentGeofence, ...payload, updated_at: new Date().toISOString() };
+      renderGeofenceSummary(state.currentGeofence);
+      els.geofenceForm.classList.add("hidden");
+      els.btnToggleEdit.textContent = "Edit Geofence";
       showToast("Geofence updated successfully.", "success");
     } catch (err) {
       showToast(err.message || "Failed to update geofence.", "error");
@@ -132,7 +201,7 @@ const AdminApp = (() => {
         els.workplaceLat.value = position.coords.latitude.toFixed(6);
         els.workplaceLon.value = position.coords.longitude.toFixed(6);
         showToast(
-          `Location captured (±${Math.round(position.coords.accuracy)}m). Click Save Geofence to apply.`,
+          `Location captured (±${Math.round(position.coords.accuracy)}m). Click Save Changes to apply.`,
           "success"
         );
       },
@@ -149,78 +218,150 @@ const AdminApp = (() => {
     );
   }
 
-  // ================= Live Attendance Table =================
+  // ================= Attendance Log =================
   async function loadRecords({ silent } = {}) {
     try {
-      const date = els.filterDate.value || undefined;
-      allRecords = await ApiClient.getAdminRecords(date);
-      renderTable(applySearch(allRecords));
+      state.allRecords = await ApiClient.getAdminRecords();
+      renderTable();
     } catch (err) {
       if (!silent) showToast("Failed to load attendance records.", "error");
-      allRecords = [];
-      renderTable([]);
+      state.allRecords = [];
+      renderTable();
     }
   }
 
-  function applySearch(records) {
-    const term = els.searchEmployee.value.trim().toLowerCase();
-    if (!term) return records;
-    return records.filter(
-      (r) =>
-        (r.employee_name && r.employee_name.toLowerCase().includes(term)) ||
-        (r.department && r.department.toLowerCase().includes(term))
-    );
+  function renderMonthLabel() {
+    const d = state.viewMonth;
+    els.monthLabel.textContent = `${MONTH_NAMES[d.getMonth()]} ${d.getFullYear()}`;
   }
 
-  function renderTable(records) {
+  function visibleRecords() {
+    const y = state.viewMonth.getFullYear();
+    const m = pad(state.viewMonth.getMonth() + 1);
+    const prefix = `${y}-${m}-`;
+    const term = els.searchEmployee.value.trim().toLowerCase();
+
+    return state.allRecords
+      .filter((r) => (r.date || "").startsWith(prefix))
+      .filter(
+        (r) =>
+          !term ||
+          (r.employee_name && r.employee_name.toLowerCase().includes(term)) ||
+          (r.department && r.department.toLowerCase().includes(term))
+      )
+      .sort((a, b) => (b.date || "").localeCompare(a.date || "") || (b.clock_in_time || "").localeCompare(a.clock_in_time || ""));
+  }
+
+  function workingHours(r) {
+    if (!r.clock_in_time || !r.clock_out_time) return null;
+    const [inH, inM] = r.clock_in_time.split(":").map(Number);
+    const [outH, outM] = r.clock_out_time.split(":").map(Number);
+    const mins = outH * 60 + outM - (inH * 60 + inM);
+    if (mins <= 0) return null;
+    return `${Math.floor(mins / 60)}h ${pad(mins % 60)}m`;
+  }
+
+  function initials(name) {
+    return (name || "?")
+      .split(" ")
+      .map((n) => n[0])
+      .join("")
+      .substring(0, 2)
+      .toUpperCase();
+  }
+
+  const clockInIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>';
+  const clockOutIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>';
+
+  function renderTable() {
+    const records = visibleRecords();
+    const monthName = `${MONTH_NAMES[state.viewMonth.getMonth()]} ${state.viewMonth.getFullYear()}`;
+    els.recordCount.textContent = records.length === 1
+      ? "1 record found"
+      : `${records.length} records found`;
+    els.monthLabel.textContent = monthName;
+
     if (!records.length) {
       els.attendanceTableBody.innerHTML =
-        '<tr><td colspan="7" class="table-empty">No attendance records found.</td></tr>';
+        `<tr><td colspan="6" class="table-empty">No attendance records for ${escapeHtml(monthName)}.</td></tr>`;
       return;
     }
 
     els.attendanceTableBody.innerHTML = records
-      .map(
-        (r) => `
-      <tr>
-        <td>
-          <strong>${escapeHtml(r.employee_name || "Staff #" + r.employee_id)}</strong>
-          <div class="cell-sub">${escapeHtml(r.department || "")}</div>
-        </td>
-        <td>${escapeHtml(r.date || "")}</td>
-        <td>
-          ${r.clock_in_time ? escapeHtml(r.clock_in_time) : "—"}
-          ${r.clock_in_distance != null ? `<div class="cell-sub">${r.clock_in_distance}m away</div>` : ""}
-        </td>
-        <td>${r.clock_out_time ? escapeHtml(r.clock_out_time) : '<span class="cell-dim">—</span>'}</td>
-        <td>
-          <span class="status-chip ${r.status === "CLOCKED_IN" ? "chip-in" : "chip-out"}">
-            ${r.status === "CLOCKED_IN" ? "On Site" : "Done"}
-          </span>
-        </td>
-        <td>
-          <span class="status-chip ${r.is_late ? "tag-late" : "tag-ontime"}">
-            ${r.is_late ? "Late" : "On Time"}
-          </span>
-        </td>
-        <td class="cell-notes">${escapeHtml(r.notes || "Verified")}</td>
-      </tr>`
-      )
+      .map((r) => {
+        const wh = workingHours(r);
+        const isOpen = state.expandedId === r.id;
+        const detail = `
+        <tr class="row-detail" ${isOpen ? "" : "hidden"}>
+          <td colspan="6">
+            <div class="detail-grid">
+              <div class="detail-item">
+                <span class="detail-label">Status</span>
+                <span class="chip ${r.status === "CLOCKED_IN" ? "on-site" : "done"}">
+                  ${r.status === "CLOCKED_IN" ? "On Site" : "Shift Completed"}
+                </span>
+              </div>
+              <div class="detail-item">
+                <span class="detail-label">Punctuality</span>
+                <span class="chip ${r.is_late ? "late" : "ontime"}">${r.is_late ? "Late Arrival" : "On Time"}</span>
+              </div>
+              <div class="detail-item">
+                <span class="detail-label">Clock-In Position</span>
+                <span class="detail-value">${r.clock_in_distance != null ? `${r.clock_in_distance}m from boundary` : "—"}</span>
+              </div>
+              <div class="detail-item">
+                <span class="detail-label">Clock-Out Position</span>
+                <span class="detail-value">${r.clock_out_distance != null ? `${r.clock_out_distance}m from boundary` : "—"}</span>
+              </div>
+              <div class="detail-item">
+                <span class="detail-label">Notes</span>
+                <span class="detail-value">${escapeHtml(r.notes || "Verified")}</span>
+              </div>
+            </div>
+          </td>
+        </tr>`;
+
+        return `
+        <tr class="row-main ${isOpen ? "open" : ""}" data-id="${r.id}">
+          <td>
+            <div class="emp-cell">
+              <span class="emp-avatar">${escapeHtml(initials(r.employee_name))}</span>
+              <span>
+                <span class="emp-name">${escapeHtml(r.employee_name || "Staff #" + r.employee_id)}</span>
+                <div class="emp-dept">${escapeHtml(r.department || "")}</div>
+              </span>
+            </div>
+          </td>
+          <td>${escapeHtml(r.date || "")}</td>
+          <td>
+            ${r.clock_in_time
+              ? `<span class="time-cell time-in ${r.is_late ? "is-late" : ""}">${clockInIcon}${escapeHtml(r.clock_in_time)}</span>`
+              : '<span class="time-cell time-none">—</span>'}
+          </td>
+          <td>
+            ${r.clock_out_time
+              ? `<span class="time-cell time-out">${clockOutIcon}${escapeHtml(r.clock_out_time)}</span>`
+              : '<span class="time-cell time-none">In progress</span>'}
+          </td>
+          <td>${wh ? `<span class="work-hrs">${wh}</span>` : '<span class="time-cell time-none">—</span>'}</td>
+          <td><span class="row-chevron"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg></span></td>
+        </tr>
+        ${detail}`;
+      })
       .join("");
   }
 
   // ================= CSV Export =================
   async function exportCsv() {
     try {
-      const date = els.filterDate.value;
-      const url = `${window.location.origin}/api/admin/export/csv${date ? `?date=${encodeURIComponent(date)}` : ""}`;
+      const url = `${window.location.origin}/api/admin/export/csv`;
       const response = await fetch(url);
       if (!response.ok) throw new Error("CSV export failed on the server.");
 
       const blob = await response.blob();
       const disposition = response.headers.get("Content-Disposition") || "";
       const match = disposition.match(/filename="?([^";]+)"?/);
-      const filename = match ? match[1] : `attendance_report_${date || "all"}.csv`;
+      const filename = match ? match[1] : "attendance_report_all.csv";
 
       const link = document.createElement("a");
       link.href = URL.createObjectURL(blob);
@@ -251,11 +392,60 @@ const AdminApp = (() => {
   function bindEvents() {
     els.btnSaveGeofence.addEventListener("click", saveGeofence);
     els.btnUseCurrentLocation.addEventListener("click", useCurrentLocation);
-    els.filterDate.addEventListener("change", () => loadRecords());
-    els.searchEmployee.addEventListener("input", () => renderTable(applySearch(allRecords)));
+
+    els.btnToggleEdit.addEventListener("click", () => {
+      const isHidden = els.geofenceForm.classList.toggle("hidden");
+      els.btnToggleEdit.textContent = isHidden ? "Edit Geofence" : "Close Editor";
+    });
+
+    els.btnPrevMonth.addEventListener("click", () => {
+      state.viewMonth = new Date(state.viewMonth.getFullYear(), state.viewMonth.getMonth() - 1, 1);
+      renderMonthLabel();
+      renderTable();
+    });
+
+    els.btnNextMonth.addEventListener("click", () => {
+      state.viewMonth = new Date(state.viewMonth.getFullYear(), state.viewMonth.getMonth() + 1, 1);
+      renderMonthLabel();
+      renderTable();
+    });
+
+    els.btnToday.addEventListener("click", () => {
+      state.viewMonth = new Date();
+      renderMonthLabel();
+      renderTable();
+    });
+
+    els.searchEmployee.addEventListener("input", renderTable);
+
     els.btnExportCsv.addEventListener("click", exportCsv);
+    if (els.navExport) {
+      els.navExport.addEventListener("click", (e) => {
+        e.preventDefault();
+        setActiveNav(els.navExport);
+        exportCsv();
+      });
+    }
+
     if (els.btnSeedDemo) els.btnSeedDemo.addEventListener("click", seedDemo);
+
+    els.attendanceTableBody.addEventListener("click", (e) => {
+      const row = e.target.closest(".row-main");
+      if (!row) return;
+      const id = parseInt(row.dataset.id, 10);
+      state.expandedId = state.expandedId === id ? null : id;
+      renderTable();
+    });
   }
+
+  function setActiveNav(activeLink) {
+    document.querySelectorAll(".nav-item").forEach((el) => el.classList.remove("active"));
+    activeLink.classList.add("active");
+  }
+
+  document.querySelectorAll(".nav-item").forEach((el) => {
+    el.addEventListener("click", () => setActiveNav(el));
+  });
 
   // ================= Toast =================
   function showToast(message, type = "info") {
@@ -266,7 +456,7 @@ const AdminApp = (() => {
 
     setTimeout(() => {
       toast.style.opacity = "0";
-      toast.style.transform = "translateX(100%)";
+      toast.style.transform = "translateY(8px)";
       toast.style.transition = "all 0.3s ease";
       setTimeout(() => toast.remove(), 300);
     }, 4000);
